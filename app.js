@@ -25,13 +25,83 @@
   if (S && !S.qids.every(id => Q[id])) S = null;
   function saveS() { try { S ? localStorage.setItem(SKEY, JSON.stringify(S)) : localStorage.removeItem(SKEY); } catch (e) {} }
 
-  function record(qid, pick) {
+  function record(qid, pick, mode) {
     const ok = pick === Q[qid].answer;
     const a = DB.ans[qid] || { n: 0, nOk: 0 };
     a.n += 1; if (ok) a.nOk += 1; a.last = pick; a.ok = ok; a.t = Date.now();
     DB.ans[qid] = a;
+    if (!ok) enqueueWrong(qid, pick, mode);
     return ok;
   }
+
+  // ---------- wrong answers → Google Drive (via Apps Script web app) ----------
+  function wrongItem(qid, pick, mode) {
+    const q = Q[qid], a = DB.ans[qid] || {};
+    return {
+      t: Date.now(), id: qid, ch: q.ch, chTitle: q.chTitle, stem: q.stem, options: q.options,
+      pick: pick === undefined ? "(not answered)" : LET[pick] + ". " + q.options[pick],
+      correct: LET[q.answer] + ". " + q.options[q.answer],
+      explanation: q.explanation, ref: q.ref, mode: mode || "practice",
+      n: a.n || 0, nOk: a.nOk || 0, note: DB.notes[qid] || ""
+    };
+  }
+  function enqueueWrong(qid, pick, mode) {
+    DB.outbox = DB.outbox || [];
+    DB.outbox.push(wrongItem(qid, pick, mode));
+    scheduleSync();
+  }
+  let syncT = null, syncing = false;
+  function scheduleSync() { clearTimeout(syncT); syncT = setTimeout(() => syncNow(false), 1500); }
+  async function syncNow(loud) {
+    const url = (DB.settings.syncUrl || "").trim();
+    DB.outbox = DB.outbox || [];
+    if (!url) { if (loud) toast("Add your Google Drive sync link in Settings first"); return false; }
+    if (!DB.outbox.length) { if (loud) toast("Nothing waiting to send"); return true; }
+    if (syncing) return false;
+    if (!navigator.onLine) { if (loud) toast("Offline – will send when you're back online"); return false; }
+    syncing = true;
+    const batch = DB.outbox.slice(0, 100);
+    const body = JSON.stringify({ token: DB.settings.syncToken || "", items: batch });
+    let ok = false, msg = "";
+    try {
+      const r = await fetch(url, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body });
+      const j = await r.json(); ok = !!j.ok; msg = j.error || "";
+    } catch (e) {
+      // Some browsers block reading the reply; send blind and trust it.
+      try { await fetch(url, { method: "POST", mode: "no-cors", headers: { "Content-Type": "text/plain;charset=utf-8" }, body }); ok = true; }
+      catch (e2) { ok = false; msg = "network error"; }
+    }
+    syncing = false;
+    if (ok) {
+      DB.outbox = DB.outbox.slice(batch.length); DB.settings.lastSync = Date.now(); save();
+      if (loud) toast(`Sent ${batch.length} wrong answer${batch.length > 1 ? "s" : ""} to Google Drive`);
+      if (DB.outbox.length) return syncNow(loud);
+    } else { save(); if (loud) toast("Sync failed" + (msg ? ": " + msg : "") + " – will retry later"); }
+    refreshSyncBadges();
+    return ok;
+  }
+  function refreshSyncBadges() {
+    document.querySelectorAll("[data-outbox]").forEach(el => el.textContent = (DB.outbox || []).length);
+  }
+  function wrongMarkdown() {
+    const ids = ALL_IDS.filter(id => DB.ans[id] && !DB.ans[id].ok);
+    let md = `# Part 2 QnA – wrong answers\nExported ${new Date().toLocaleString()} · ${ids.length} questions\n\n`;
+    ids.forEach((id, k) => {
+      const it = wrongItem(id, DB.ans[id].last, "export");
+      md += `## ${k + 1}. [${String(it.ch).padStart(3, "0")} ${it.chTitle}] ${id}\n\n${it.stem}\n\n`;
+      it.options.forEach((o, i) => md += `- ${LET[i]}. ${o}\n`);
+      md += `\n**My answer:** ${it.pick}  \n**Correct:** ${it.correct}  \n**Record:** ${it.nOk}/${it.n} correct\n\n**Explanation:** ${it.explanation}\n\n*Source: ${it.ref}*\n`;
+      if (it.note) md += `\n**My notes:** ${it.note}\n`;
+      md += `\n---\n\n`;
+    });
+    return { md, n: ids.length };
+  }
+  function download(name, text, type) {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([text], { type: type || "text/plain" }));
+    a.download = name; a.click();
+  }
+  window.addEventListener("online", () => syncNow(false));
 
   // ---------- helpers ----------
   const app = document.getElementById("app");
@@ -74,7 +144,7 @@
     if (!S) return;
     stopTimer();
     if (S.mode === "exam") {
-      S.qids.forEach(id => { if (S.picks[id] !== undefined) record(id, S.picks[id]); S.done[id] = true; });
+      S.qids.forEach(id => { if (S.picks[id] !== undefined) record(id, S.picks[id], "exam"); S.done[id] = true; });
     }
     const st = { n: S.qids.length, ok: 0, ans: 0 };
     S.qids.forEach(id => { if (S.picks[id] !== undefined && S.done[id]) { st.ans++; if (S.picks[id] === Q[id].answer) st.ok++; } });
@@ -251,8 +321,20 @@
       ids.forEach(id => h += `<div class="res-item" data-goto="#/view/${id}" style="padding:12px 16px"><span class="pill">${String(Q[id].ch).padStart(3, "0")}</span><div class="res-txt">${esc(Q[id].stem)}${f === null ? `<div class="ch-meta">📝 ${esc(DB.notes[id])}</div>` : ""}</div></div>`);
       return h + `</div>`;
     };
-    app.innerHTML = `<h1>Review</h1><p class="sub">Questions you got wrong, flagged, or wrote notes on.</p>` +
+    const linked = !!(DB.settings.syncUrl || "").trim();
+    const driveCard = `<div class="card" style="margin-bottom:6px"><div class="row"><div><b>☁ Google Drive</b>
+      <div class="ch-meta">${linked ? `Wrong answers are sent automatically · <span data-outbox>${(DB.outbox || []).length}</span> waiting${DB.settings.lastSync ? " · last sent " + new Date(DB.settings.lastSync).toLocaleString() : ""}` : "Not linked yet – set it up in Settings so wrong answers go to Drive automatically"}</div></div>
+      <div class="spacer"></div>${linked ? `<button class="btn sm primary" id="syncNow">Send now</button><button class="btn sm" id="sendAll">Send all ${wrong.length} wrong</button>` : `<a class="btn sm primary" href="#/settings">Set up</a>`}
+      <button class="btn sm" id="dlWrong">Download (.md)</button></div></div>`;
+    app.innerHTML = `<h1>Review</h1><p class="sub">Questions you got wrong, flagged, or wrote notes on.</p>` + driveCard +
       block("Incorrect", wrong, "incorrect") + block("Flagged", flags, "flagged") + block("My notes", notes, null);
+    const sn = document.getElementById("syncNow"); if (sn) sn.onclick = () => syncNow(true).then(() => viewReview());
+    const sa = document.getElementById("sendAll"); if (sa) sa.onclick = () => {
+      if (!wrong.length) return toast("No wrong answers to send");
+      wrong.forEach(id => { DB.outbox = DB.outbox || []; DB.outbox.push(wrongItem(id, DB.ans[id].last, "review-export")); });
+      save(); syncNow(true).then(() => viewReview());
+    };
+    document.getElementById("dlWrong").onclick = () => { const { md, n } = wrongMarkdown(); if (!n) return toast("No wrong answers yet"); download(`part2qna-wrong-answers-${new Date().toISOString().slice(0, 10)}.md`, md, "text/markdown"); };
     app.querySelectorAll("[data-rev]").forEach(b => b.onclick = () => startSession(filterIds(ALL_IDS, b.dataset.rev), { shuffle: true, mode: "practice", title: b.dataset.rev === "incorrect" ? "Retry incorrect" : "Flagged questions" }));
     bindCommon();
   }
@@ -344,7 +426,7 @@
   function submit() {
     const qid = S.qids[S.idx];
     if (S.mode !== "practice" || S.done[qid] || S.picks[qid] === undefined) return;
-    record(qid, S.picks[qid]); S.done[qid] = true; save(); saveS(); viewSession();
+    record(qid, S.picks[qid], "practice"); S.done[qid] = true; save(); saveS(); viewSession();
   }
   function move(d) { const n = S.idx + d; if (n < 0 || n >= S.qids.length) return; S.idx = n; saveS(); viewSession(); }
 
@@ -393,12 +475,26 @@
     setNav("settings");
     app.innerHTML = `<h1>Settings</h1><p class="sub">Your progress is saved in this browser only.</p>
       <div class="card"><div class="row"><div><b>Dark mode</b></div><div class="spacer"></div><button class="btn sm" id="dark">${DB.settings.dark ? "On" : "Off"}</button></div></div>
+      <h2>Send wrong answers to Google Drive</h2>
+      <div class="card"><p style="margin-top:0">Paste the Web app link from your Google Apps Script (see <b>apps-script/SETUP.md</b> in the repo). Every wrong answer is then added to the Google Sheet <i>"Part 2 QnA – Wrong Answers"</i> in your Drive, ready for Claude to analyse.</p>
+        <div class="field"><span class="lbl">Web app link</span><input id="syncUrl" style="width:100%" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(DB.settings.syncUrl || "")}"></div>
+        <div class="field"><span class="lbl">Secret word (optional – must match TOKEN in the script)</span><input id="syncToken" style="width:100%" value="${esc(DB.settings.syncToken || "")}"></div>
+        <div class="row"><button class="btn primary" id="saveSync">Save</button><button class="btn" id="testSync">Save &amp; send test</button>
+        <span class="ch-meta"><span data-outbox>${(DB.outbox || []).length}</span> waiting to send${DB.settings.lastSync ? " · last sent " + new Date(DB.settings.lastSync).toLocaleString() : ""}</span></div></div>
       <h2>Move progress between devices</h2>
       <div class="card"><p style="margin-top:0">Export a backup file on one device and import it on the other (e.g. laptop → phone).</p>
         <div class="row"><button class="btn primary" id="exp">Export progress</button><label class="btn">Import progress<input type="file" id="imp" accept="application/json" hidden></label></div></div>
       <h2>Reset</h2>
       <div class="card"><div class="row"><button class="btn danger" id="reset">Reset all progress</button><span class="ch-meta">Clears answers, flags, notes and history.</span></div></div>
       <h2>About</h2><div class="card ch-meta">${BANK.length} chapters · ${ALL_IDS.length} questions. Questions were written from your daily study notes (Master of Surgery – Daily Study Notes). Add new chapters with build.py – see README.md.</div>`;
+    const keep = () => { DB.settings.syncUrl = document.getElementById("syncUrl").value.trim(); DB.settings.syncToken = document.getElementById("syncToken").value.trim(); save(); };
+    document.getElementById("saveSync").onclick = () => { keep(); toast("Saved"); syncNow(false); };
+    document.getElementById("testSync").onclick = () => {
+      keep();
+      DB.outbox = DB.outbox || [];
+      DB.outbox.push({ t: Date.now(), id: "TEST", ch: 0, chTitle: "Connection test", stem: "Test row from Part 2 QnA – you can delete this row.", options: [], pick: "-", correct: "-", explanation: "-", ref: "-", mode: "test", n: 0, nOk: 0, note: "" });
+      save(); syncNow(true).then(() => viewSettings());
+    };
     document.getElementById("dark").onclick = () => { DB.settings.dark = !DB.settings.dark; save(); applyTheme(); viewSettings(); };
     document.getElementById("exp").onclick = () => {
       const blob = new Blob([JSON.stringify(DB, null, 1)], { type: "application/json" });
@@ -452,4 +548,5 @@
   window.addEventListener("beforeunload", () => { if (S) saveS(); });
   applyTheme();
   route();
+  setTimeout(() => syncNow(false), 2000);
 })();

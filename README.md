@@ -17,6 +17,12 @@ Open `index.html` in any browser (double-click works – no server needed).
 Progress is saved in the browser (localStorage), separately on each device.
 To move progress between laptop and phone: **Settings → Export progress**, then **Import** on the other device.
 
+## Wrong answers → Google Drive
+
+Every wrong answer can be sent automatically to a Google Sheet in your Drive
+("Part 2 QnA – Wrong Answers") for Claude to analyse later. One-time setup: see
+[`apps-script/SETUP.md`](apps-script/SETUP.md). No setup? Review → **Download (.md)** gives you a file to upload by hand.
+
 ## Add a new daily topic
 
 1. Copy `data/ch014.json` to `data/ch015.json` and fill it in:

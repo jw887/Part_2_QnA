@@ -81,7 +81,7 @@ label.chk input{margin-top:4px;width:18px;height:18px;accent-color:var(--teal)}
 .seg button.on{background:var(--teal);color:#fff}
 .field{margin:14px 0}
 .field > .lbl{font-weight:600;margin-bottom:6px;display:block}
-input[type=number],textarea,select{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--card);color:var(--ink)}
+input[type=number],input:not([type]),textarea,select{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--card);color:var(--ink)}
 textarea{width:100%;min-height:70px;resize:vertical}
 
 /* question screen */
